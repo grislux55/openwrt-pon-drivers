@@ -6,6 +6,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=airoha-pon-frontends
 PKG_RELEASE:=13
+PKG_URL:=https://github.com/grislux55/nnrrwrt-drivers/tree/main/airoha-pon-frontends
 PKG_LICENSE:=GPL-2.0-only
 
 include $(INCLUDE_DIR)/package.mk

@@ -7,6 +7,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=airoha-xpon
 PKG_RELEASE:=70
+PKG_URL:=https://github.com/grislux55/nnrrwrt-drivers/tree/main/airoha-xpon
 PKG_LICENSE:=GPL-2.0-only
 
 include $(INCLUDE_DIR)/package.mk
