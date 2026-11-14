@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/device.h>
+#include <linux/kernel.h>
 #include <linux/leds.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
@@ -8,6 +9,8 @@
 
 #include "airoha-xpon-epon.h"
 #include "airoha-xpon-private.h"
+
+#ifdef CONFIG_LEDS_TRIGGERS
 
 #define AIROHA_XPON_LED_FAST_BLINK_MS 200
 #define AIROHA_XPON_LED_SLOW_BLINK_MS 500
@@ -20,39 +23,93 @@ enum airoha_xpon_led_state {
 	AIROHA_XPON_LED_ON,
 };
 
-struct airoha_xpon_leds {
-	struct device *dev;
-	struct led_trigger *registration;
-	struct led_trigger *los;
-	struct led_trigger *online;
-	struct mutex lock;
-	char registration_name[IFNAMSIZ + sizeof("-registration")];
-	char los_name[IFNAMSIZ + sizeof("-los")];
-	char online_name[IFNAMSIZ + sizeof("-online")];
-	enum airoha_xpon_led_state registration_state;
-	enum airoha_xpon_led_state los_state;
-	enum airoha_xpon_led_state online_state;
+struct airoha_xpon_led_trig {
+	struct led_trigger trig;
+	bool registered;
+	enum airoha_xpon_led_state state;
+	char name[IFNAMSIZ + sizeof("-registration")];
 };
 
-static void airoha_xpon_led_apply(struct led_trigger *trigger,
+struct airoha_xpon_leds {
+	struct device *dev;
+	struct mutex lock;
+	struct airoha_xpon_led_trig registration;
+	struct airoha_xpon_led_trig los;
+	struct airoha_xpon_led_trig online;
+};
+
+static int airoha_xpon_led_trig_activate(struct led_classdev *led_cdev)
+{
+	struct airoha_xpon_led_trig *t =
+		container_of(led_cdev->trigger, struct airoha_xpon_led_trig,
+		             trig);
+	enum airoha_xpon_led_state state = READ_ONCE(t->state);
+
+	switch (state) {
+	case AIROHA_XPON_LED_FAST_BLINK:
+		led_blink_set_nosleep(led_cdev, AIROHA_XPON_LED_FAST_BLINK_MS,
+		                      AIROHA_XPON_LED_FAST_BLINK_MS);
+		break;
+	case AIROHA_XPON_LED_SLOW_BLINK:
+		led_blink_set_nosleep(led_cdev, AIROHA_XPON_LED_SLOW_BLINK_MS,
+		                      AIROHA_XPON_LED_SLOW_BLINK_MS);
+		break;
+	case AIROHA_XPON_LED_ON:
+		led_blink_set_nosleep(led_cdev, 1, 0);
+		break;
+	case AIROHA_XPON_LED_OFF:
+	case AIROHA_XPON_LED_UNKNOWN:
+	default:
+		led_set_brightness(led_cdev, LED_OFF);
+		break;
+	}
+
+	return 0;
+}
+
+static void airoha_xpon_led_trig_init(struct airoha_xpon_led_trig *t,
+                                      const char *pon_name,
+                                      const char *suffix)
+{
+	t->state = AIROHA_XPON_LED_UNKNOWN;
+	snprintf(t->name, sizeof(t->name), "%s-%s", pon_name, suffix);
+	t->trig.name = t->name;
+	t->trig.activate = airoha_xpon_led_trig_activate;
+	if (!led_trigger_register(&t->trig))
+		t->registered = true;
+}
+
+static void airoha_xpon_led_trig_cleanup(struct airoha_xpon_led_trig *t)
+{
+	if (!t->registered)
+		return;
+
+	led_trigger_unregister(&t->trig);
+	t->registered = false;
+}
+
+static void airoha_xpon_led_apply(struct airoha_xpon_led_trig *t,
                                   enum airoha_xpon_led_state state)
 {
+	if (!t->registered)
+		return;
+
 	/* The LED core treats delay_off=0 as steady on and stops the blink timer. */
 	switch (state) {
 	case AIROHA_XPON_LED_FAST_BLINK:
-		led_trigger_blink(trigger, AIROHA_XPON_LED_FAST_BLINK_MS,
+		led_trigger_blink(&t->trig, AIROHA_XPON_LED_FAST_BLINK_MS,
 		                  AIROHA_XPON_LED_FAST_BLINK_MS);
 		break;
 	case AIROHA_XPON_LED_SLOW_BLINK:
-		led_trigger_blink(trigger, AIROHA_XPON_LED_SLOW_BLINK_MS,
+		led_trigger_blink(&t->trig, AIROHA_XPON_LED_SLOW_BLINK_MS,
 		                  AIROHA_XPON_LED_SLOW_BLINK_MS);
 		break;
 	case AIROHA_XPON_LED_ON:
-		led_trigger_blink(trigger, 1, 0);
+		led_trigger_blink(&t->trig, 1, 0);
 		break;
 	case AIROHA_XPON_LED_OFF:
 	default:
-		led_trigger_event(trigger, LED_OFF);
+		led_trigger_event(&t->trig, LED_OFF);
 		break;
 	}
 }
@@ -62,38 +119,26 @@ struct airoha_xpon_leds *airoha_xpon_leds_create(struct device *dev,
 {
 	struct airoha_xpon_leds *leds;
 
-	/* Triggers consume line state independently of the PON control path. */
-	if (!IS_ENABLED(CONFIG_LEDS_TRIGGERS))
-		return NULL;
-
 	leds = kzalloc(sizeof(*leds), GFP_KERNEL);
 	if (!leds)
 		return NULL;
 
 	leds->dev = dev;
 	mutex_init(&leds->lock);
-	leds->registration_state = AIROHA_XPON_LED_UNKNOWN;
-	leds->los_state = AIROHA_XPON_LED_UNKNOWN;
-	leds->online_state = AIROHA_XPON_LED_UNKNOWN;
-	snprintf(leds->registration_name, sizeof(leds->registration_name),
-	         "%s-registration", pon_name);
-	snprintf(leds->los_name, sizeof(leds->los_name), "%s-los", pon_name);
-	snprintf(leds->online_name, sizeof(leds->online_name), "%s-online",
-	         pon_name);
+	airoha_xpon_led_trig_init(&leds->registration, pon_name,
+	                          "registration");
+	airoha_xpon_led_trig_init(&leds->los, pon_name, "los");
+	airoha_xpon_led_trig_init(&leds->online, pon_name, "online");
 
-	led_trigger_register_simple(leds->registration_name,
-	                            &leds->registration);
-	led_trigger_register_simple(leds->los_name, &leds->los);
-	led_trigger_register_simple(leds->online_name, &leds->online);
-
-	if (!leds->registration && !leds->los && !leds->online) {
+	if (!leds->registration.registered && !leds->los.registered &&
+	    !leds->online.registered) {
 		mutex_destroy(&leds->lock);
 		kfree(leds);
 		return NULL;
 	}
 
 	dev_info(dev, "PON LED triggers registered: %s, %s, %s\n",
-	         leds->registration_name, leds->los_name, leds->online_name);
+	         leds->registration.name, leds->los.name, leds->online.name);
 	return leds;
 }
 
@@ -105,9 +150,9 @@ void airoha_xpon_leds_destroy(void *data)
 		return;
 
 	/* Line teardown publishes OFF before unregistering trigger consumers. */
-	led_trigger_unregister_simple(leds->online);
-	led_trigger_unregister_simple(leds->los);
-	led_trigger_unregister_simple(leds->registration);
+	airoha_xpon_led_trig_cleanup(&leds->online);
+	airoha_xpon_led_trig_cleanup(&leds->los);
+	airoha_xpon_led_trig_cleanup(&leds->registration);
 	mutex_destroy(&leds->lock);
 	kfree(leds);
 }
@@ -158,17 +203,35 @@ void airoha_xpon_leds_update(struct airoha_xpon *xpon)
 
 	/* Keep the LED mutex outside the state_lock/ploam_lock hardware order. */
 	mutex_lock(&leds->lock);
-	if (leds->los_state != los) {
-		leds->los_state = los;
-		airoha_xpon_led_apply(leds->los, los);
+	if (READ_ONCE(leds->los.state) != los) {
+		WRITE_ONCE(leds->los.state, los);
+		airoha_xpon_led_apply(&leds->los, los);
 	}
-	if (leds->registration_state != registration) {
-		leds->registration_state = registration;
-		airoha_xpon_led_apply(leds->registration, registration);
+	if (READ_ONCE(leds->registration.state) != registration) {
+		WRITE_ONCE(leds->registration.state, registration);
+		airoha_xpon_led_apply(&leds->registration, registration);
 	}
-	if (leds->online_state != online) {
-		leds->online_state = online;
-		airoha_xpon_led_apply(leds->online, online);
+	if (READ_ONCE(leds->online.state) != online) {
+		WRITE_ONCE(leds->online.state, online);
+		airoha_xpon_led_apply(&leds->online, online);
 	}
 	mutex_unlock(&leds->lock);
 }
+
+#else /* !CONFIG_LEDS_TRIGGERS */
+
+struct airoha_xpon_leds *airoha_xpon_leds_create(struct device *dev,
+                                                 const char *pon_name)
+{
+	return NULL;
+}
+
+void airoha_xpon_leds_destroy(void *data)
+{
+}
+
+void airoha_xpon_leds_update(struct airoha_xpon *xpon)
+{
+}
+
+#endif /* CONFIG_LEDS_TRIGGERS */
